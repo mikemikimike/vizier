@@ -1,11 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use anyhow::Result;
 use chrono::Utc;
 use rig_core::message::Message;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{
@@ -35,11 +35,43 @@ use crate::{
 /// Requests waiting for the session's running job, each with where its response goes.
 type SessionQueue = VecDeque<(VizierRequest, Option<flume::Sender<VizierResponse>>)>;
 
+struct AbortOnDropTask(Option<JoinHandle<()>>);
+
+impl AbortOnDropTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDropTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 fn abort_session_silent(
     session: &VizierSession,
-    main_handles: &mut HashMap<VizierSession, JoinHandle<()>>,
-    thinking_handles: &mut HashMap<VizierSession, Arc<JoinHandle<()>>>,
+    main_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
+    thinking_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
     session_queues: &mut HashMap<VizierSession, SessionQueue>,
+    active_responses: &mut HashMap<VizierSession, flume::Sender<VizierResponse>>,
     storage: &VizierStorage,
 ) -> bool {
     let had_in_flight = main_handles
@@ -55,28 +87,33 @@ fn abort_session_silent(
     if let Some(handle) = thinking_handles.remove(session) {
         handle.abort();
     }
+    if let Some(response_tx) = active_responses.remove(session) {
+        send_abort_response(&response_tx);
+    }
     let storage_clone = storage.clone();
     let session_clone = session.clone();
     tokio::spawn(async move {
         let _ = storage_clone
-            .update_thinking_state(
-                session_clone.0,
-                session_clone.1,
-                session_clone.2,
-                false,
-            )
+            .update_thinking_state(session_clone.0, session_clone.1, session_clone.2, false)
             .await;
     });
-    session_queues.remove(session);
+    if let Some(queue) = session_queues.remove(session) {
+        for (_, response_tx) in queue {
+            if let Some(response_tx) = response_tx {
+                send_abort_response(&response_tx);
+            }
+        }
+    }
 
     had_in_flight
 }
 
 async fn abort_session_notify(
     session: &VizierSession,
-    main_handles: &mut HashMap<VizierSession, JoinHandle<()>>,
-    thinking_handles: &mut HashMap<VizierSession, Arc<JoinHandle<()>>>,
+    main_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
+    thinking_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
     session_queues: &mut HashMap<VizierSession, SessionQueue>,
+    active_responses: &mut HashMap<VizierSession, flume::Sender<VizierResponse>>,
     storage: &VizierStorage,
     response_tx: &Option<flume::Sender<VizierResponse>>,
 ) {
@@ -85,6 +122,7 @@ async fn abort_session_notify(
         main_handles,
         thinking_handles,
         session_queues,
+        active_responses,
         storage,
     );
     if had_in_flight {
@@ -101,12 +139,64 @@ async fn abort_session_notify(
     }
 }
 
+fn send_abort_response(response_tx: &flume::Sender<VizierResponse>) {
+    let _ = response_tx.send(VizierResponse {
+        timestamp: chrono::Utc::now(),
+        content: VizierResponseContent::Abort,
+        attachments: vec![],
+        ..Default::default()
+    });
+}
+
+async fn shutdown_session_jobs(
+    main_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
+    thinking_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
+    session_queues: &mut HashMap<VizierSession, SessionQueue>,
+    active_responses: &mut HashMap<VizierSession, flume::Sender<VizierResponse>>,
+    storage: &VizierStorage,
+) {
+    let mut sessions = HashSet::new();
+
+    for (session, handle) in main_handles.iter_mut() {
+        sessions.insert(session.clone());
+        if !handle.is_finished() {
+            handle.abort();
+            if let Some(response_tx) = active_responses.get(session) {
+                send_abort_response(response_tx);
+            }
+        }
+    }
+    for (session, queue) in session_queues.drain() {
+        sessions.insert(session);
+        for (_, response_tx) in queue {
+            if let Some(response_tx) = response_tx {
+                send_abort_response(&response_tx);
+            }
+        }
+    }
+    for (session, handle) in thinking_handles.drain() {
+        sessions.insert(session);
+        handle.abort_and_wait().await;
+    }
+    for (_, handle) in main_handles.drain() {
+        handle.abort_and_wait().await;
+    }
+    active_responses.clear();
+
+    for session in sessions {
+        let _ = storage
+            .update_thinking_state(session.0, session.1, session.2, false)
+            .await;
+    }
+}
+
 pub async fn agent_process(
     agent_id: AgentId,
     deps: VizierDependencies,
     agent_config: AgentConfig,
     indexer: Option<crate::indexer::VizierIndexer>,
     mut shutdown_rx: watch::Receiver<bool>,
+    ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
     let agent =
         Arc::new(VizierAgent::new(agent_id.clone(), &deps, &agent_config, indexer.clone()).await?);
@@ -116,13 +206,16 @@ pub async fn agent_process(
     let mut agent_channels = spawn_agent_channels(&agent_id, &agent_config, &deps).await;
     agent_channels.run().await;
 
-    let mut main_handles = HashMap::<VizierSession, JoinHandle<()>>::new();
-    let mut thinking_handles = HashMap::<VizierSession, Arc<JoinHandle<()>>>::new();
+    let mut main_handles = HashMap::<VizierSession, AbortOnDropTask>::new();
+    let mut thinking_handles = HashMap::<VizierSession, AbortOnDropTask>::new();
+    let mut active_responses = HashMap::<VizierSession, flume::Sender<VizierResponse>>::new();
     let mut detail_tasks = JoinSet::new();
 
     let mut session_queues = HashMap::<VizierSession, SessionQueue>::new();
     let mut message_counts = HashMap::<VizierSession, usize>::new();
-    let (complete_tx, mut complete_rx) = mpsc::unbounded_channel::<VizierSession>();
+    let (complete_tx, mut complete_rx) = mpsc::unbounded_channel::<(VizierSession, u64)>();
+    let mut active_job_ids = HashMap::<VizierSession, u64>::new();
+    let mut next_job_id = 0u64;
     let jobs = SessionJobs {
         agent: agent.clone(),
         agent_config: agent_config.clone(),
@@ -131,6 +224,7 @@ pub async fn agent_process(
         complete_tx,
     };
 
+    let _ = ready_tx.send(());
     tracing::info!(agent_id = %agent_id, "agent process loop started");
 
     loop {
@@ -237,6 +331,7 @@ pub async fn agent_process(
                             &mut main_handles,
                             &mut thinking_handles,
                             &mut session_queues,
+                            &mut active_responses,
                             &deps.storage,
                             &response_tx,
                         )
@@ -300,29 +395,57 @@ pub async fn agent_process(
                     session,
                     request,
                     response_tx,
-                    &mut main_handles,
-                    &mut thinking_handles,
+                    &mut SessionJobState {
+                        main_handles: &mut main_handles,
+                        thinking_handles: &mut thinking_handles,
+                        active_responses: &mut active_responses,
+                        active_job_ids: &mut active_job_ids,
+                        next_job_id: &mut next_job_id,
+                    },
                 );
             }
             // Handle task completions — process next queued message
-            Some(completed_session) = complete_rx.recv() => {
-                if let Some((next_request, response_tx)) = session_queues
-                    .get_mut(&completed_session)
-                    .and_then(|queue| queue.pop_front())
-                {
-                    start_session_job(
-                        &jobs,
-                        completed_session,
-                        next_request,
-                        response_tx,
-                        &mut main_handles,
-                        &mut thinking_handles,
-                    );
+            Some((completed_session, job_id)) = complete_rx.recv() => {
+                if finish_session_job(
+                    &completed_session,
+                    job_id,
+                    &mut active_job_ids,
+                    &mut thinking_handles,
+                    &mut active_responses,
+                ) {
+                    if let Some((next_request, response_tx)) = session_queues
+                        .get_mut(&completed_session)
+                        .and_then(|queue| queue.pop_front())
+                    {
+                        start_session_job(
+                            &jobs,
+                            completed_session,
+                            next_request,
+                            response_tx,
+                            &mut SessionJobState {
+                                main_handles: &mut main_handles,
+                                thinking_handles: &mut thinking_handles,
+                                active_responses: &mut active_responses,
+                                active_job_ids: &mut active_job_ids,
+                                next_job_id: &mut next_job_id,
+                            },
+                        );
+                    }
                 }
             }
         }
     }
 
+    detail_tasks.abort_all();
+    while detail_tasks.join_next().await.is_some() {}
+    shutdown_session_jobs(
+        &mut main_handles,
+        &mut thinking_handles,
+        &mut session_queues,
+        &mut active_responses,
+        &deps.storage,
+    )
+    .await;
     agent_channels.shutdown().await;
     Ok(())
 }
@@ -334,7 +457,15 @@ struct SessionJobs {
     agent_config: AgentConfig,
     deps: VizierDependencies,
     indexer: Option<VizierIndexer>,
-    complete_tx: mpsc::UnboundedSender<VizierSession>,
+    complete_tx: mpsc::UnboundedSender<(VizierSession, u64)>,
+}
+
+struct SessionJobState<'a> {
+    main_handles: &'a mut HashMap<VizierSession, AbortOnDropTask>,
+    thinking_handles: &'a mut HashMap<VizierSession, AbortOnDropTask>,
+    active_responses: &'a mut HashMap<VizierSession, flume::Sender<VizierResponse>>,
+    active_job_ids: &'a mut HashMap<VizierSession, u64>,
+    next_job_id: &'a mut u64,
 }
 
 /// `/checkpoint` and `/lobotomy`: commands that write a new checkpoint for the session.
@@ -346,7 +477,7 @@ fn is_handover_command(request: &VizierRequest) -> bool {
 /// picked up yet: its completion is still on its way, and starting a request now would
 /// jump ahead of the queue.
 fn session_is_busy(
-    main_handles: &HashMap<VizierSession, JoinHandle<()>>,
+    main_handles: &HashMap<VizierSession, AbortOnDropTask>,
     session_queues: &HashMap<VizierSession, SessionQueue>,
     session: &VizierSession,
 ) -> bool {
@@ -358,6 +489,25 @@ fn session_is_busy(
             .is_some_and(|queue| !queue.is_empty())
 }
 
+fn finish_session_job(
+    session: &VizierSession,
+    job_id: u64,
+    active_job_ids: &mut HashMap<VizierSession, u64>,
+    thinking_handles: &mut HashMap<VizierSession, AbortOnDropTask>,
+    active_responses: &mut HashMap<VizierSession, flume::Sender<VizierResponse>>,
+) -> bool {
+    if active_job_ids.get(session) != Some(&job_id) {
+        return false;
+    }
+
+    active_job_ids.remove(session);
+    active_responses.remove(session);
+    if let Some(handle) = thinking_handles.remove(session) {
+        handle.abort();
+    }
+    true
+}
+
 /// Runs one request as the session's job. Registered in `main_handles`, so anything that
 /// arrives meanwhile queues behind it, `/abort` stops it, and its completion starts the
 /// next queued request.
@@ -366,16 +516,19 @@ fn start_session_job(
     session: VizierSession,
     request: VizierRequest,
     response_tx: Option<flume::Sender<VizierResponse>>,
-    main_handles: &mut HashMap<VizierSession, JoinHandle<()>>,
-    thinking_handles: &mut HashMap<VizierSession, Arc<JoinHandle<()>>>,
+    state: &mut SessionJobState<'_>,
 ) {
+    *state.next_job_id = (*state.next_job_id).wrapping_add(1);
+    let job_id = *state.next_job_id;
+    state.active_job_ids.insert(session.clone(), job_id);
+
     // handle thinking
-    if let Some(handle) = thinking_handles.get(&session) {
+    if let Some(handle) = state.thinking_handles.remove(&session) {
         handle.abort();
     }
     let thinking_response_tx = response_tx.clone();
     let thinking_request = request.clone();
-    let thinking_handle = Arc::new(tokio::spawn(async move {
+    let thinking_handle = tokio::spawn(async move {
         if matches!(thinking_request.content, VizierRequestContent::Chat(_) | VizierRequestContent::AudioChat(_, _) | VizierRequestContent::BackgroundReport(_)) {
             if let Some(ref tx) = thinking_response_tx {
                 let _ = tx
@@ -388,8 +541,16 @@ fn start_session_job(
                     .await;
             }
         }
-    }));
-    thinking_handles.insert(session.clone(), thinking_handle.clone());
+    });
+    state
+        .thinking_handles
+        .insert(session.clone(), AbortOnDropTask::new(thinking_handle));
+
+    if let Some(response_tx) = response_tx.clone() {
+        state.active_responses.insert(session.clone(), response_tx);
+    } else {
+        state.active_responses.remove(&session);
+    }
 
     let agent = jobs.agent.clone();
     let agent_config = jobs.agent_config.clone();
@@ -397,9 +558,9 @@ fn start_session_job(
     let storage = deps.storage.clone();
     let indexer = jobs.indexer.clone();
     let complete_tx = jobs.complete_tx.clone();
-    main_handles.insert(
+    state.main_handles.insert(
         session.clone(),
-        tokio::spawn(async move {
+        AbortOnDropTask::new(tokio::spawn(async move {
             // Set is_thinking = true
             let _ = storage
                 .update_thinking_state(session.0.clone(), session.1.clone(), session.2.clone(), true)
@@ -447,15 +608,13 @@ fn start_session_job(
                 }
             }
 
-            thinking_handle.abort();
-
             // Set is_thinking = false
             let _ = storage
                 .update_thinking_state(session.0.clone(), session.1.clone(), session.2.clone(), false)
                 .await;
 
-            let _ = complete_tx.send(session);
-        }),
+            let _ = complete_tx.send((session, job_id));
+        })),
     );
 }
 
@@ -1348,5 +1507,192 @@ mod auto_context_tests {
         let rendered = crate::agents::agent::system_prompt::context::context_md(&[p], &[], None);
         assert!(rendered.contains(r#"truncated="true""#), "{rendered}");
         assert!(rendered.contains("truncated to fit"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::future::pending;
+
+    use super::*;
+    use crate::{
+        config::VizierConfig,
+        dependencies::VizierDependencies,
+        schema::{VizierChannelId, VizierSessionDetail},
+        storage::session::SessionStorage,
+    };
+
+    #[tokio::test]
+    async fn shutdown_aborts_active_and_queued_responses_and_clears_thinking() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VizierConfig {
+            workspace: directory.path().to_string_lossy().into_owned(),
+            ..VizierConfig::default()
+        };
+        let deps = VizierDependencies::new(config).await.unwrap();
+        let storage = deps.storage;
+        let session = VizierSession(
+            "agent".into(),
+            VizierChannelId::HTTP("user".into(), "webui".into()),
+            Some("topic".into()),
+        );
+        storage
+            .save_session_detail(VizierSessionDetail {
+                agent_id: session.0.clone(),
+                channel: session.1.clone(),
+                topic: session.2.clone(),
+                title: "topic".into(),
+                is_thinking: true,
+            })
+            .await
+            .unwrap();
+
+        let (active_tx, active_rx) = flume::unbounded();
+        let late_response_tx = active_tx.clone();
+        let (turn_started_tx, turn_started_rx) = oneshot::channel();
+        let mut main_handles = HashMap::new();
+        main_handles.insert(
+            session.clone(),
+            AbortOnDropTask::new(tokio::spawn(async move {
+                let _ = turn_started_tx.send(());
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = late_response_tx.send(VizierResponse {
+                    timestamp: Utc::now(),
+                    content: VizierResponseContent::Message {
+                        content: "late old turn output".into(),
+                        stats: None,
+                    },
+                    attachments: vec![],
+                    ..Default::default()
+                });
+            })),
+        );
+        turn_started_rx.await.unwrap();
+        let mut thinking_handles = HashMap::new();
+        thinking_handles.insert(
+            session.clone(),
+            AbortOnDropTask::new(tokio::spawn(async { pending::<()>().await })),
+        );
+        let (queued_tx, queued_rx) = flume::unbounded();
+        let mut active_responses = HashMap::from([(session.clone(), active_tx)]);
+        let mut session_queues = HashMap::from([(
+            session.clone(),
+            VecDeque::from([(VizierRequest::default(), Some(queued_tx))]),
+        )]);
+
+        shutdown_session_jobs(
+            &mut main_handles,
+            &mut thinking_handles,
+            &mut session_queues,
+            &mut active_responses,
+            &storage,
+        )
+        .await;
+
+        assert!(main_handles.is_empty());
+        assert!(thinking_handles.is_empty());
+        assert!(session_queues.is_empty());
+        assert!(active_responses.is_empty());
+        assert!(matches!(
+            active_rx.recv().unwrap().content,
+            VizierResponseContent::Abort
+        ));
+        assert!(matches!(
+            active_rx.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            queued_rx.recv().unwrap().content,
+            VizierResponseContent::Abort
+        ));
+        let detail = storage
+            .get_session_detail_by_topic(session.0, session.1, session.2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!detail.is_thinking);
+    }
+
+    #[tokio::test]
+    async fn stale_turn_completion_does_not_clear_replacement_turn_state() {
+        let session = VizierSession(
+            "agent".into(),
+            VizierChannelId::HTTP("user".into(), "webui".into()),
+            Some("topic".into()),
+        );
+        let mut active_job_ids = HashMap::from([(session.clone(), 2)]);
+        let (response_tx, response_rx) = flume::unbounded();
+        let mut active_responses = HashMap::from([(session.clone(), response_tx)]);
+        let (thinking_started_tx, thinking_started_rx) = oneshot::channel();
+        let mut thinking_handles = HashMap::from([(
+            session.clone(),
+            AbortOnDropTask::new(tokio::spawn(async move {
+                let _ = thinking_started_tx.send(());
+                pending::<()>().await;
+            })),
+        )]);
+        thinking_started_rx.await.unwrap();
+
+        assert!(!finish_session_job(
+            &session,
+            1,
+            &mut active_job_ids,
+            &mut thinking_handles,
+            &mut active_responses,
+        ));
+
+        assert_eq!(active_job_ids.get(&session), Some(&2));
+        assert!(active_responses.contains_key(&session));
+        assert!(
+            thinking_handles
+                .get(&session)
+                .is_some_and(|handle| !handle.is_finished())
+        );
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(flume::TryRecvError::Empty)
+        ));
+
+        let handle = thinking_handles.remove(&session).unwrap();
+        handle.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_agent_process_aborts_child_turn_tasks() {
+        let (turn_started_tx, turn_started_rx) = oneshot::channel();
+        let (turn_dropped_tx, turn_dropped_rx) = oneshot::channel();
+        let process = tokio::spawn(async move {
+            let mut main_handles = HashMap::new();
+            main_handles.insert(
+                VizierSession(
+                    "agent".into(),
+                    VizierChannelId::HTTP("user".into(), "webui".into()),
+                    Some("topic".into()),
+                ),
+                AbortOnDropTask::new(tokio::spawn(async move {
+                    struct SignalOnDrop(Option<oneshot::Sender<()>>);
+                    impl Drop for SignalOnDrop {
+                        fn drop(&mut self) {
+                            if let Some(sender) = self.0.take() {
+                                let _ = sender.send(());
+                            }
+                        }
+                    }
+
+                    let _signal = SignalOnDrop(Some(turn_dropped_tx));
+                    let _ = turn_started_tx.send(());
+                    pending::<()>().await;
+                })),
+            );
+            pending::<()>().await;
+        });
+
+        turn_started_rx.await.unwrap();
+        process.abort();
+        let _ = process.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), turn_dropped_rx)
+            .await
+            .expect("child turn was detached when its process task was cancelled")
+            .unwrap();
     }
 }
